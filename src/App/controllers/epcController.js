@@ -1,102 +1,146 @@
 const Epc = require("../models/Epc");
 const Product = require("../models/Product");
+const { broadcastData } = require("../../config/wsConfig");
 
 class EpcController {
-  // Lấy tất cả EPC
-  async fetchAllEPCs(req, res) {
+  // GET /get-epcs
+  async getEpcs(req, res) {
     try {
-      const epcs = await Epc.find().populate("product");
+      const epcs = await Epc.find().populate("product", "name description");
       res.status(200).json(epcs);
-    } catch (error) {
-      res.status(500).json({ message: "Error fetching EPCs", error });
-    }
-  }
-
-  // Lấy EPC theo ID
-  async getEPCById(req, res) {
-    try {
-      const { id } = req.params;
-      const epc = await Epc.findById(id).populate("product");
-      if (!epc) {
-        return res.status(404).json({ message: "EPC not found" });
-      }
-      res.status(200).json(epc);
-    } catch (error) {
-      res.status(500).json({ message: "Error fetching EPC by ID", error });
-    }
-  }
-
-  // Lấy danh sách EPC theo Product ID
-  async getEPCsByProductId(req, res) {
-    try {
-      const { productId } = req.params;
-      const epcs = await Epc.find({ product: productId }).populate("product");
-      res.status(200).json(epcs);
-    } catch (error) {
+    } catch (err) {
       res
         .status(500)
-        .json({ message: "Error fetching EPCs by product ID", error });
+        .json({ message: "Error fetching EPCs", error: err.message });
     }
   }
 
-  // Thêm mới EPC
-  async addEPC(req, res) {
+  // GET /check-assign/:epc
+  async checkAssign(req, res) {
+    try {
+      const { epc } = req.params;
+
+      const foundEpc = await Epc.findOne({ epc }).populate(
+        "product",
+        "name description"
+      );
+      if (!foundEpc) {
+        return res.status(404).json({ message: "EPC not found" });
+      }
+
+      res.status(200).json({
+        epc: foundEpc.epc,
+        isAssigned: !!foundEpc.product,
+        product: foundEpc.product || null,
+      });
+    } catch (err) {
+      res
+        .status(500)
+        .json({ message: "Error checking EPC assignment", error: err.message });
+    }
+  }
+
+  // POST /assign
+  async assign(req, res) {
     try {
       const { epc, productId } = req.body;
 
-      // Kiểm tra sản phẩm tồn tại
+      if (!epc || !productId) {
+        return res
+          .status(400)
+          .json({ message: "EPC and Product ID are required" });
+      }
+
+      // Kiểm tra sản phẩm có tồn tại không
       const product = await Product.findById(productId);
       if (!product) {
         return res.status(404).json({ message: "Product not found" });
       }
 
-      // Kiểm tra EPC trùng lặp
-      const existingEPC = await Epc.findOne({ epc });
-      if (existingEPC) {
-        return res.status(400).json({ message: "EPC already exists" });
+      // Kiểm tra EPC có tồn tại không
+      let epcRecord = await Epc.findOne({ epc });
+      if (epcRecord) {
+        if (epcRecord.product) {
+          return res.status(400).json({
+            message: "EPC is already assigned to a product",
+            product: epcRecord.product,
+          });
+        }
+        // Cập nhật EPC đã tồn tại
+        epcRecord.product = productId;
+        epcRecord.assignedAt = new Date();
+        epcRecord.status = "assigned";
+      } else {
+        // Tạo EPC mới
+        epcRecord = new Epc({
+          epc,
+          product: productId,
+          assignedAt: new Date(),
+          status: "assigned",
+        });
       }
 
-      // Thêm EPC mới
-      const newEPC = new Epc({ epc, product: productId });
-      await newEPC.save();
-      res.status(201).json(newEPC);
-    } catch (error) {
-      res.status(500).json({ message: "Error adding EPC", error });
-    }
-  }
+      await epcRecord.save();
 
-  // Cập nhật EPC
-  async updateEPC(req, res) {
-    try {
-      const { id } = req.params;
-      const updates = req.body;
-
-      const updatedEPC = await Epc.findByIdAndUpdate(id, updates, {
-        new: true,
+      res.status(200).json({
+        message: "EPC successfully assigned to product",
+        epc: epcRecord,
       });
-      if (!updatedEPC) {
-        return res.status(404).json({ message: "EPC not found" });
-      }
-
-      res.status(200).json(updatedEPC);
-    } catch (error) {
-      res.status(500).json({ message: "Error updating EPC", error });
+    } catch (err) {
+      res
+        .status(500)
+        .json({ message: "Error assigning EPC", error: err.message });
     }
   }
 
-  // Xóa EPC
-  async deleteEPC(req, res) {
+  async sendAndBroadcast(req, res) {
     try {
-      const { id } = req.params;
+      const { epc } = req.body;
 
-      const deletedEPC = await Epc.findByIdAndDelete(id);
-      if (!deletedEPC) {
-        return res.status(404).json({ message: "EPC not found" });
+      if (!epc) {
+        return res.status(400).json({ message: "EPC is required" });
       }
 
-      res.status(200).json({ message: "EPC deleted successfully" });
-    } catch (error) {
-      res.status(500).json({ message: "Error deleting EPC", error });
+      // Tìm thông tin EPC trong database
+      const epcData = await Epc.findOne({ epc }).populate(
+        "product",
+        "name description"
+      );
+
+      let dataToSend;
+
+      if (epcData) {
+        // Nếu EPC tồn tại trong database
+        dataToSend = {
+          epc: epcData.epc,
+          isAssigned: !!epcData.product,
+          product: epcData.product || null,
+          assignedAt: epcData.assignedAt,
+        };
+      } else {
+        // Nếu EPC không tồn tại trong database
+        dataToSend = {
+          epc: epc,
+          isAssigned: false,
+          product: null,
+          assignedAt: null,
+        };
+      }
+
+      // Sử dụng broadcastData để gửi dữ liệu qua WebSocket
+      broadcastData(dataToSend);
+
+      // Phản hồi client
+      res.status(200).json({
+        message: epcData
+          ? "EPC data successfully broadcasted to clients"
+          : "EPC not found in the database, broadcasting unassigned EPC",
+        data: dataToSend,
+      });
+    } catch (err) {
+      res
+        .status(500)
+        .json({ message: "Error processing EPC", error: err.message });
     }
   }
 }
